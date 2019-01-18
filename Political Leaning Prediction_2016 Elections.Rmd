@@ -1,0 +1,629 @@
+---
+title: "Predicting the Political Leaning of Individuals in the 2016 Elections"
+author: "Sachin Sridhar, Jeffrey Fossett, Saran Liukasemsarn, Elliot Smalling"
+date: "April 24, 2018"
+
+output: 
+  pdf_document: 
+    fig_width: 8
+    fig_height: 3.5
+---
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(knitr)
+opts_chunk$set(cache=F, warning=FALSE, message=FALSE, echo = FALSE)
+```
+
+```{r, cache=FALSE, echo=FALSE}
+library(dplyr)
+library(ggplot2)
+library(gtools)
+library(ggthemes)
+library(tidyr)
+library(scales)
+library(countrycode)
+library(knitr)
+library(stargazer)
+library(broom)
+library(mgcv)
+#library(gam)
+
+#setwd('~/Files/school/stat_149_glms/final_project/')
+
+my_theme <- theme_base() + 
+  theme(legend.position = 'none', 
+        legend.title = element_blank(), 
+        legend.text = element_text(size = 9),
+        title = element_text(size=10),
+        axis.title = element_text(size=9), 
+        axis.text = element_text(size=6,face="plain"), 
+        strip.text = element_text(size=7,face="plain"), 
+        panel.border=element_blank())
+
+na.convert.mean = function (frame) 
+{
+    vars <- names(frame)
+    if (!is.null(resp <- attr(attr(frame, "terms"), "response"))) {
+        vars <- vars[-resp]
+        x <- frame[[resp]]
+        pos <- is.na(x)
+        if (any(pos)) {
+            frame <- frame[!pos, , drop = FALSE]
+            warning(paste(sum(pos), "observations omitted due to missing values in the response"))
+        }
+    }
+    for (j in vars) {  #j is variable names
+        x <- frame[[j]]
+        pos <- is.na(x)
+        if (any(pos)) {
+            if (length(levels(x))) {   # factors
+                xx <- as.character(x)
+                xx[pos] <- "NA"
+                x <- factor(xx, exclude = NULL)
+            }
+            else if (is.matrix(x)) {   # matrices
+                ats <- attributes(x)
+                x.na <- 1*pos
+#               x[pos] <- 0
+                w <- !pos
+                n <- nrow(x)
+                TT <- array(1, c(1, n))
+                xbar <- (TT %*% x)/(TT %*% w)
+                xbar <- t(TT) %*% xbar
+                x[pos] <- xbar[pos]
+                attributes(x) <- ats
+                attributes(x.na) <- ats
+                dimnames(x.na)[[2]]=paste(dimnames(x)[[2]],".na",sep='')
+                frame[[paste(j,".na",sep='')]] <- x.na 
+            } else {   # ordinary numerical vector
+                ats <- attributes(x)
+                x[pos] <- mean(x[!pos])
+#               x[pos] <- 0
+                x.na <- 1*pos
+                frame[[paste(j,".na",sep='')]] <- x.na 
+                attributes(x) <- ats
+            }
+            frame[[j]] <- x
+        }
+    }
+    frame
+}
+
+# Read the data 
+df <- read.csv("train.csv", stringsAsFactors = F)
+```
+
+## Introduction 
+
+Information regarding political inclination of individuals is vital for political organizations to best understand how to identify and enhance their support base. Core concepts of generalized linear models can be applied in this regard to predict the political leaning of an individual, based on a given set of features. The objective of this project is to build a model that most accurately predicts the political inclination of an individual (Democratic or Republican), based on the individual's biographical information and some behavioral and financial attributes  such as purchase preferences and social activities. Since this is a binary classification problem, techniques such as logistic regression and additive models have been applied to arrive at the best predictive model.
+
+## Data Cleaning and Exploration
+
+The data set for our analysis comes from Blue Labs on Kaggle. The data set contains 10,439 observations, with 47 predictor variables and one outcome `support_dem`, which takes on the value 1, if the individual self-reported supporting a Democratic candidate in 2016, and 0 otherwise. Of the 10,439 observations, 3,975 (or about 38%) report supporting a Democratic candidate.
+
+The first step of our analysis is to clean the data set to prepare it for modeling. First, we notice that several of the predictor variables are perfectly collinear. For example, each observation has a `1` for exactly one of the three predictors \texttt{density rural}, \texttt{density urban} and \texttt{density suburban}. We combine these predictors into a single categorical predictor for "density" (to which we can later apply contrast coding) so that model coefficient can be identified. Similarly, a new factor variable "Marital Status" has been developed, which takes on the values "Single", "Married" or "Unknown". 
+
+Next, we notice that many of the predictor variables have `NA` (missing) values. For quantitative predictors with missing values (`age`, `cnty_pct_religious` and `cnty_pct_evangelical`), we use the `na.convert.mean` function from previous homework assignments to impute the mean age for the missing observations, and create new predictors (`age.na`, `cnty_pct_religious.na` and `cnty_pct_evangelical.na`), which are indicators for whether the observation was missing. We notice that a substantial share of our observations (942 or around 9%) have missing `education` information. To handle this, we add a new "unknown" level to the education factor for these observations.  
+
+### Exploring Quantitative Predictors
+
+The next step is to explore the quantitative predictors in the data set. We present histograms and summary statistics for these predictors below. In the histograms, we notice that many of these variables, namely, median income, PPI, and the number of children (which is not shown), are right skewed, and thus, the log transformation has been applied on them, to give a more symmetric result.
+
+```{r, fig.width=7}
+df %>% 
+  select(age, census_median_income, ppi, cnty_pct_evangelical, cnty_pct_religious) %>% 
+  mutate(census_median_income = census_median_income/1000) %>%
+  gather(var, val) %>% 
+  filter(var != 'cnty_pct_evangelical') %>% 
+  mutate(var = factor(var, 
+                      levels = c("age", "census_median_income", "cnty_pct_evangelical", "cnty_pct_religious", "ppi"), 
+                      labels=c("Age", "Med. Inc (Thousands)", "% Evangelical", "% Religious", "PPI"))) %>% 
+  ggplot(aes(x=val, fill = var)) + geom_histogram() + 
+  facet_grid(.~var, scales = 'free_x') + 
+  my_theme + 
+  xlab("Value of Observation") + 
+  ylab("Count of Observations") + 
+  ggtitle("Histograms of Quantitative Predictor Variables")
+```
+
+```{r}
+df %>%
+  select(age, census_median_income, ppi, cnty_pct_evangelical, cnty_pct_religious) %>%
+  mutate(census_median_income = census_median_income/1000) %>% 
+  gather(var, val) %>%
+  mutate(var = factor(var, 
+                      levels = c("age",  "ppi", "cnty_pct_evangelical", "cnty_pct_religious", "census_median_income"),
+                      labels = c("Age",  "PPI", "% Evangelical", "% Religious", "Med Income (thousands)"))
+  ) %>% 
+  group_by(var) %>%
+  summarise(
+      min = min(val, na.rm = T)
+    , pct_25 = quantile(val, .25, na.rm = T)
+    , avg = mean(val, na.rm = T)
+    , med = median(val, na.rm = T)
+    , pct_75 = quantile(val, .75, na.rm = T)
+    , max = max(val, na.rm = T)
+    , sd = sd(val, na.rm=T)
+  ) %>% 
+  kable(digits = 2, col.names = c("Variable", "Min", "25th Pctile", "Mean", "Median", "75th Pctile", "Max", "SD"), caption = "Summary Statistics for Quantitative Predictors")
+```
+
+\noindent The next step is to create plots describing the association between each predictor and the outcome. Localized smoothers have been used to approximate the proportion of voters supporting democrats, at a given value of the quantitative predictor variable. 
+
+```{r, fig.width=7}
+df %>% 
+  select(age, census_median_income, ppi, cnty_pct_evangelical, cnty_pct_religious, suppdem) %>% 
+  mutate(census_median_income = census_median_income/1000,
+         suppdem = ifelse(suppdem=="Y",1,0)) %>%
+  gather(var, val, -suppdem) %>% 
+  mutate(var = factor(var, 
+                      levels = c("age", "census_median_income", "cnty_pct_evangelical", "cnty_pct_religious", "ppi"), 
+                      labels=c("Age", "Med. Inc (Thousands)", "% Evangelical", "% Religious", "PPI"))) %>% 
+  ggplot(aes(x=val, y=suppdem)) + geom_smooth() +
+  facet_grid(.~var, scales = 'free_x') + 
+  my_theme + 
+  xlab("Value of Predictor") + 
+  ylab("Proportion Supporting Democrats") + 
+  ggtitle("Smooths of Quantitative Predictor Variables versus Response Variable")
+```
+
+We see that for all variables there is an overall downward trend in the proportion of voters supporting Democrats as the predictor value increases. Additionally, we observe strong evidence of a non-linear relationship between the predictor variables and the response.
+
+### Exploring Binary Predictors
+
+Next, we present summaries of binary indicator variables in the data set. First, we present a plot showing the absolute difference in the percentage of individuals who report supporting a Democratic candidate in 2016, corresponding to each of the binary indicators. The results are sorted by the strength of association between the indicator and the outcome variable. In the appendix, we also provide more detailed summary statistics on the binary outcomes. 
+
+```{r, fig.height=5}
+binaries <- c("homeowner","renter","hasreligion","catholic","christian","bible_reader","interest_in_religion","donrever_1","liberal_donor","conservative_donor","contbrel_1","contbpol_1","contbhlt_1","blue_collar","farmer","professional_technical","retired","apparel_1","bookmusc_1","electrnc_1","boatownr_1","cat_1","environm_1","outdgrdn_1","outdoor_1","guns_1","golf_1","investor_1","veteran_1","expensive_items_1")
+
+df %>% 
+  select(binaries) %>% 
+  gather(var, val) %>% 
+  group_by(var) %>% 
+  summarise(share_yes = mean(val)) %>% 
+  inner_join(
+    df %>% 
+      select(binaries, suppdem) %>% 
+      gather(var, val, -suppdem) %>% 
+      group_by(var, val) %>% 
+      summarise(share_supp = mean(ifelse(suppdem=='Y',1,0))) %>% 
+      mutate(val = factor(val, labels = c("No", "Yes"))) %>% 
+      spread(val, share_supp) %>% 
+      mutate(Abs_Delta = Yes-No)
+  ) -> df_bin_summary
+
+df_bin_summary %>% 
+  ggplot(aes(x=reorder(var, Abs_Delta), y = Abs_Delta, fill=Abs_Delta)) + 
+  geom_bar(stat='identity', colour = 'black', size=.3) + coord_flip() + 
+  ylab("Absolute Difference in % Supporting Democrat (Ind=1 - Ind=0)") + 
+  scale_y_continuous(label=percent) + 
+  xlab("Indicator") + 
+  scale_fill_gradient2(low = "red",
+  high = "blue", midpoint = 0, space = "Lab",
+  na.value = "grey50", guide = "colourbar") + 
+  my_theme + 
+  ggtitle("Absolute Difference in % Support Democrat for Binary Indicators")
+```
+
+\noindent Most results from the plot are as we would expect. For example, we see that renters (a group which presumably skews younger and more cosmopolitan) and people who are liberal donors are substantially more likely to support a Democratic candidate. By constrast, being a homeowner or a conservative donor is strongly negatively associated with supporting a Democratic candidate. Many of the other binary indicators in the dataset (e.g. relating to religion, gun ownership, consumer goods etc.) seem also to be negatively associated with supporting a Democrat. 
+
+### Exploring Categorical Predictors  
+
+After combining mutually exclusive binary variables as described above, the dataset contains five categorical variables. The different levels of these categorical variables and their proportions of the dataset are presented in Table 2 below, as well as the proportion of each level that supports Democrats. Based on this analysis, ethnicity seems to be predictive of political leaning, with 69% of African Americans in the dataset supporting Democrats, but only 30% of white people. With the density variable we see a similar divide, with over half of urban residents supporting Democrats but only 24% of rural residents. The impact of Education on political leaning is less clear, with relatively similar proportions among the groups, and with \texttt{no hs degree} and \texttt{post graduate degree}, the least and most educated, being the most likely to support Democrats.
+
+We also see the effect of missing or imbalanced categorical variables in the table below. While the proportion supporting Democrats of the \texttt{other} marital status and \texttt{Unknown} sex levels is starkly different from other levels in their respective categories, they both are underrepresented in the dataset, so it will be challenging to understand their relationship with the outcome variable.
+
+```{r}
+# Actually do all the data cleaning
+clean_data <- function(df){
+  
+  df %>% 
+    mutate(
+      density_clean = ifelse(density_rural==1, "rural", 
+                             ifelse(density_suburban==1, "suburban",
+                                    ifelse(density_urban==1, "urban", "other"))), 
+      marital_status_clean = ifelse(single==1, "single", ifelse(married==1, "married", "other")),
+      education = ifelse(is.na(education),"unknown",education),
+      log_ppi = log(ppi), 
+      log_income = log(census_median_income), 
+      log_nchildren = log(num_children+0.01)#, 
+      #log_pct_evangelical = log(cnty_pct_evangelical)
+    ) %>% 
+    select(
+      -density_rural, -density_suburban, -density_urban, -single, -married, -census_median_income, -ppi,-num_children#, -cnty_pct_evangelical
+    ) %>%  na.convert.mean() -> df
+  
+  return(df)
+  
+}
+
+# Clean the data
+df_clean <- clean_data(df) %>% mutate(support_dem = ifelse(suppdem=='Y', 1, 0)) %>% select(-suppdem)
+```
+
+```{r}
+factor_vars <- c("sex","combined_ethnicity_4way","education","density_clean","marital_status_clean")
+select(df_clean, factor_vars, support_dem) %>% gather(var, val, -support_dem) %>%
+  group_by(var, val) %>% summarise(prop=n()/nrow(df_clean), prop_dem = mean(support_dem)) %>%
+  arrange(var,prop_dem) %>%
+  kable(digits=2, col.names = c("Variable","Level","% Total","% Support Democrat"),
+        caption = "Summary Statistics for Categorical Variables")
+```
+
+## Multivariate Analysis and Modeling
+
+### Analysis Plan
+
+\noindent Following the data cleaning process and the exploratory data analysis, the data set is ready for modeling. To allow us to estimate out-of-sample performance, we split the Kaggle data into a training and test set in an 80-20 ratio. Our modeling strategy is to first build a baseline model, and then to improve on it by considering different link functions (comparing the results using the logit, probit and the complimentary log log links), including interaction terms, as well as using smoothers and additive models. 
+
+```{r}
+# Run a train test split on the clean data 
+set.seed(117)
+
+train <- sample(1:nrow(df_clean), size=nrow(df_clean)*.8)
+df_clean[train, ] -> df_train
+df_clean[-train, ] -> df_test
+
+# Write to CSV
+#df_train %>% write.csv("df_train.csv", row.names = F)
+#df_test %>% write.csv("df_test.csv", row.names = F)
+```
+
+### Building a Baseline Model 
+
+\noindent  To arrive at a baseline model, we first fit a logisitic regression including all of the available predictor variables (see appendix for this model), and then use (1) the variance inflation factor (VIF) and (2) analysis of deviance to develop a more parsimonious model.  
+
+#### Variance Inflation Factor 
+
+We first use the variance inflation factor (VIF) to test for collinearity. Given the presence of several categorical variables, we use the adjusted VIF output to account for the predictor degrees of freedom. Conventionally, a score of 10 or above indicates that a variable is highly collinear and should be removed from consideration. In the table below, showing the highest VIF scores in our initial model, we see that no variables reach this threshold and thus no predictors are removed based on this test.Still, while we did not remove any variables because of this, we can see, for example, that \texttt{homeowner} and \texttt{renter} may be redundant, as are the several religion-related variables also showing higher VIF scores. We would be concerned if all of these variables appeared in our final model together.
+
+```{r}
+# Fit as lm for vif
+baseline_lm <- lm(support_dem ~ ., data=df_train)
+car::vif(baseline_lm) %>% as.data.frame() -> res
+res %>% mutate(names = rownames(res), adj_GVIF = GVIF^(1/Df)) %>%
+  select(names, adj_GVIF) %>% arrange(desc(adj_GVIF)) %>% top_n(10, adj_GVIF) %>%
+  kable(caption = "Top 10 VIF Scores for Predictor Variables",
+        col.names = c("Variable","Adjusted GVIF"))
+```
+
+#### Analysis of Deviance 
+
+\noindent Our initial logistic regression model has many non-significant coefficients. Hence, we run an analysis of deviance procedure to see which variables can be excluded from the model. In particular, we use a stepwise backward selection procedure that works as follows: assume we start with a model with $n$ predictors. Exclude each one of them, one at a time, and perform a likelihood ratio test for each of the models with $n-1$ predictors, and select the model which produces the most statistically insignificant result (highest $p$-value greater than 0.05). This would represent the scenario that one of the predictors has been excluded without a loss in the predictive power of the model. This process is repeated until all likelihood ratio tests performed with the exclusion of one of the predictor variables yields a statistically significant result ($p$-value less than 0.05), and hence, we would retain all the remaining predictors. After running this variable selection procedure, we arrive at a model with 19 predictors, which is summarized in Table 4.
+
+```{r}
+# Fit baseline logit
+baseline_all_preds <- glm(support_dem ~ ., data=df_train, family = binomial(link='logit'))
+```
+
+```{r, eval=F}
+my_predictors <- colnames(df) %>% setdiff("support_dem")
+
+backward_elimination = function() {
+  # all the predictors
+  all_predictors = my_predictors
+  quit = F
+  # loop until exit condition is satisfied
+  while (quit == F) {
+    n_predictors = length(all_predictors)
+    # if we have just one predictor left, return the predictor
+    if (n_predictors == 1) {
+      return(all_predictors)
+    }
+    # otherwise, fit the model with all the predictors we have
+    previous_best_formula = paste0("support_dem ~ ", 
+                                   (paste(all_predictors, collapse="+")))
+    previous_best_model = glm(as.formula(previous_best_formula), 
+                              family = binomial, data = df)
+    # create a vector for p-values
+    pvals = rep(NA, n_predictors)
+    # create a list to store every subset of predictors
+    predictor_sets = list()
+    # indices
+    set_indices = 1:n_predictors
+    # for each set
+    for (i in set_indices) {
+      boolean_for_predictors = rep(T, n_predictors)
+      boolean_for_predictors[i] = F
+      # get all except one predictors
+      current_predictors = all_predictors[boolean_for_predictors]
+      # fit the model
+      current_formula = paste0("support_dem ~ ", 
+                               (paste(current_predictors, collapse="+")))
+      current_model = glm(as.formula(current_formula), 
+                          family = binomial, data = df)
+      # compare to the previous best model
+      anova_result = anova(current_model, previous_best_model, test = "Chi")
+      # store the predictor sets
+      predictor_sets[[i]] = current_predictors
+      # store the corresponding p-values
+      pvals[i] <- anova_result$`Pr(>Chi)`[2]
+    }
+    # if there is a p-value that is larger than 5%
+    if (max(pvals) > 0.05) {
+      # update the set "all_predictors"
+      all_predictors <- predictor_sets[[set_indices[pvals == max(pvals)]]]
+    }
+    else {
+      return(all_predictors)
+    } 
+  }
+}
+
+best_predictors = backward_elimination()
+```
+
+```{r, results='asis'}
+best_predictors <- c("sex", 
+"combined_ethnicity_4way", 
+"log_nchildren", 
+"education", 
+"hasreligion", 
+"catholic", 
+"christian", 
+"interest_in_religion", 
+"donrever_1", 
+"liberal_donor", 
+"conservative_donor", 
+"contbrel_1", 
+"apparel_1", 
+"cat_1", 
+"outdoor_1", 
+"guns_1", 
+"cnty_pct_evangelical", 
+"density_clean", 
+"marital_status_clean")
+
+best_formula = paste0("support_dem ~ ", 
+                      (paste(best_predictors, collapse="+")))
+
+pruned_baseline_model <- glm(as.formula(best_formula), family = binomial, data = df_train)
+
+# Print the results
+tidy(pruned_baseline_model) %>% 
+  mutate(Sig = stars.pval(p.value)) %>% 
+  kable(caption = "Baseline Logit Model Summary", digits = 2, col.names=c("Predictor", "Est", "Std Err", "t-Stat", "P-Value", "Sig?")) 
+```
+
+\noindent Examining the estimated coefficients in the baseline model, we see that they largely confirm our findings from our initial exploration of the data. For example, the coefficients for African American and White ethnicities are very significant and are directionally consistent with what we initially postulated: the positive coefficient for African Americans indicates an increased probability of supporting Democrats, while the negative coefficient for White indicates the opposite. The positive effect of living in an urban area on the likelihood of supporting Democrats is similarly confirmed in this model. Interestingly, of the continuous variables in the data set, only \texttt{cnty pct evangelical} was included in this model. The smooth of this variable showed an approximately linear relationship with probability of supporting Democrats, reinforcing its inclusion in the model. The other continuous variables, which were found to have a non-linear relationship to the response, are not included.
+
+To create a benchmark to assess predictive power, below we calculate the discrepancy measure for our baseline model on both the training and the held-out test dataset.
+
+```{r}
+# Discrepancy function 
+discrepancy <- function(truths, predicted_prob) {
+  return(-mean(truths*log(predicted_prob) + (1-truths)*log(1-predicted_prob)))
+}
+
+# Print results on Baseline performance
+pred_train <- predict(pruned_baseline_model, df_train, type = "response")
+pred_test <- predict(pruned_baseline_model, df_test, type = "response")
+data.frame(Data = c("Train","Test"),
+           Discrepancy = c(discrepancy(df_train$support_dem,pred_train),
+                           discrepancy(df_test$support_dem,pred_test))) %>%
+  kable(digits = 4, caption = "Discrepancy of Predictions: Baseline Model")
+```
+
+\noindent We see our baseline model has a discrepancy of roughly `0.59` on the test set. We attempt to improve on this performance below. 
+
+### Improving the Model (GAM and Interactions)
+
+\noindent Recognizing that continuous predictors in our data set may have non-linear relationships to the response variable, we attempt to improve upon the logistic regression model by fitting a generalized additive model (or GAM). We again use the stepwise analysis of deviance procedure described above, including all predictors, as well as the smooths of the continuous predictors. Additionally, several interactions between the categorical variables that had the potential to be predictive have been handpicked, based on the initial data exploration.
+
+\noindent Incorporating interactions of variables into the model proved challenging, given our treatment of missing values of the categorical predictors. For example, \texttt{sex} is a strong candidate to interact with other variables, as the way other variables influence political beliefs may affect men and women differently. However, since the observations missing \texttt{sex} had been coded as a separate category, there wasn't sufficient data to estimate the effect of this \texttt{Usex} "Unknown sex" interacted with another variable. Still, some interactions did not pose this problem and were included in the stepwise procedure. However, none were included in the final model. The results of our final GAM model are presented in Table 6. 
+
+```{r, eval=FALSE}
+library(gam)
+backward_elimination2 = function() {
+  # all the predictors
+  all_predictors = my_predictors
+  quit = F
+  # loop until exit condition is satisfied
+  while (quit == F) {
+    n_predictors = length(all_predictors)
+    # if we have just one predictor left, return the predictor
+    if (n_predictors == 1) {
+      return(all_predictors)
+    }
+    # otherwise, fit the model with all the predictors we have
+    previous_best_formula = paste0("support_dem ~ ", 
+                                    (paste(all_predictors, collapse="+")))
+    previous_best_model = gam(as.formula(previous_best_formula), 
+                               family = binomial, data = df_train)
+    # create a vector for p-values
+    pvals = rep(NA, n_predictors)
+    # create a list to store every subset of predictors
+    predictor_sets = list()
+    # indices
+    set_indices = 1:n_predictors
+    # for each set
+    for (i in set_indices) {
+      boolean_for_predictors = rep(T, n_predictors)
+      boolean_for_predictors[i] = F
+      # get all except one predictors
+      current_predictors = all_predictors[boolean_for_predictors]
+      # fit the model
+      current_formula = paste0("support_dem ~ ", 
+                                (paste(current_predictors, collapse="+")))
+      current_model = gam(as.formula(current_formula), 
+                           family = binomial, data = df_train)
+      # compare to the previous best model
+      anova_result = anova(current_model, previous_best_model, test = "Chi")
+      # store the predictor sets
+      predictor_sets[[i]] = current_predictors
+      # store the corresponding p-values
+      pvals[i] <- anova_result$`Pr(>Chi)`[2]
+    }
+    # if there is a p-value that is larger than 5%
+    if (max(pvals) > 0.05) {
+      # update the set "all_predictors"
+      all_predictors <- predictor_sets[[set_indices[pvals == max(pvals)]]]
+    }
+    else {
+      return(all_predictors)
+    } 
+  }
+}
+exclude <- c("support_dem","age","log_ppi","cnty_pct_religious","cnty_pct_evangelical",
+             "log_nchildren","log_income")
+my_predictors <- c(colnames(df_train),"s(age)","s(log_ppi)","s(cnty_pct_religious)",
+                   "s(cnty_pct_evangelical)", "s(log_nchildren)","s(log_income)",
+                   "density_clean:combined_ethnicity_4way") %>%
+  setdiff(exclude)
+best_predictors <- backward_elimination2()
+```
+
+\newpage
+```{r next}
+library(mgcv)
+
+# The selected model formula 
+best_formula <- "support_dem ~ sex + combined_ethnicity_4way + education + hasreligion + catholic + interest_in_religion + donrever_1 + liberal_donor + conservative_donor + contbrel_1 + apparel_1 + cat_1 + outdgrdn_1 + guns_1 + density_clean + marital_status_clean + s(age) + s(log_ppi) + s(cnty_pct_religious) + s(cnty_pct_evangelical) + s(log_nchildren,k=5)"
+
+# Fit the model 
+final_model <- mgcv::gam(as.formula(best_formula), family=binomial, data=df_train)
+
+# Print the model results 
+data.frame(variable = names(final_model$coefficients),
+           estimate = final_model$coefficients,
+           row.names = NULL) %>% 
+  filter(substr(variable,1,2)!="s(") %>% 
+  mutate(p.value = summary(final_model)$p.pv, 
+         Sig = stars.pval(p.value)) %>% 
+  kable(caption = "GAM Model Summary", digits = 2, col.names=c("Predictor", "Est", "P-Value", "Sig?"))
+```
+
+\noindent After arriving at a final GAM model, we again predict on the test set and present the discrepancy measure. The discrepancy measured for our GAM model (0.5950), is slightly lower than that of the baseline GLM (0.5953) when evaluated on the test dataset, suggesting that this could indeed be a better predictive model. Hence, this has been selected as our final model for submission on Kaggle.
+
+```{r}
+pred_train <- predict(final_model, df_train, type = "response")
+pred_test <- predict(final_model, df_test, type = "response")
+data.frame(Data = c("Train","Test"),
+           Discrepancy = c(discrepancy(df_train$support_dem,pred_train),
+                           discrepancy(df_test$support_dem,pred_test))) %>%
+  kable(digits = 4, caption = "Discrepancy of Predictions: Final Model")
+```
+
+### Testing Assumptions
+
+By using the deviance-based stepwise backward selection procedure, it has been ensured that each predictor included in the model resulted in a better fit that was statistically significant. Additionally, we conduct a Hosmer-Lemeshow test on the model to confirm its goodness of fit. Below we see that for several different sized groupings of the data, the null hypothesis - that the probabilities predicted by the model are consistent with the observed data, was not rejected. This indicates that there is no systemic lack of fit.
+
+```{r}
+final_model <- mgcv::gam(as.formula(best_formula), family=binomial, data=df_clean)
+
+hosmerlem = function (y, yhat, g = 10) {
+    cutyhat = cut(yhat, breaks = quantile(yhat, probs = seq(0,
+        1, 1/g)), include.lowest = T)
+    obs = xtabs(cbind(1 - y, y) ~ cutyhat)
+    expect = xtabs(cbind(1 - yhat, yhat) ~ cutyhat)
+    chisq = sum((obs - expect)^2/expect)
+    P = 1 - pchisq(chisq, g - 2)
+    c("X^2" = chisq, Df = g - 2, "P(>Chi)" = P)
+    }
+grps <- c(5,7,10); pvals <- numeric(3)
+for (i in 1:3) {pvals[i] <- hosmerlem(df_clean$support_dem, fitted(final_model), g=grps[i])[3]}
+data.frame(groups = grps, pvalues = pvals) %>% kable(caption = "Hosmer-Lemeshow test")
+```
+
+The plot of Cook's distances suggests that there are no influential points to be concerned about, since the values of the Cook's distances $D_i$ are considerably less than $1$. 
+
+```{r,fig.height=4}
+plot(cooks.distance(final_model), ylab = "Cook's distances", xlab = 'Observation Index', main = "Cook's distances for the response variable", pch = 16, cex = .6)
+abline(h=1,lty = 'dotted')
+```
+
+We get a sense of outlier points by examining a binned residual plot of the data. While there are one or two points moderately more extreme than the others, there are no glaring groups of observations with large average residuals. The points are generally evenly dispersed around the horizontal "zero-residual" line, suggesting residual assumptions are met.
+
+```{r,fig.height=4.3}
+arm::binnedplot(fitted(final_model), residuals(final_model, type="response"), pch = 16, cex = .75)
+```
+
+### Interpreting Results
+
+Since we arrived at the final model by starting from the full model, with all predictors, and removing one variable at a time through the analysis of deviance procedure, all predictors yield statistically significant results on the likelihood ratio test. Five predictors in the final model are continuous variables: \verb+age+, \verb+log_ppi+, \verb+cnty_pct_religious+, \verb+cnty_pct_evangelical+, and \verb+log_nchildren+, while the remaining are all either categorical or binary variables. The complete list of predictors in the final model and their types is given below: 
+
+\bigskip
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{rllrl}
+\hline
+& type & variable name \\
+\hline
+1  & categorical  & sex \\
+2  &              & combined\textunderscore ethnicity\textunderscore 4way \\
+3  &              & education \\
+4  &              & density\textunderscore clean \\
+5  &              & marital\textunderscore status\textunderscore clean \\
+6  & binary       & hasreligion \\
+7  &              & catholic \\
+8  &              & interest\textunderscore in\textunderscore religion \\
+9  &              & donrever\textunderscore 1 \\
+10 &              & liberal\textunderscore donor \\
+11 &              & conservative\textunderscore donor  \\
+12 &              & contbrel\textunderscore 1 \\
+13 &              & apparel\textunderscore 1 \\
+14 &              & cat\textunderscore 1 \\
+15 &              & outdgrdn\textunderscore 1 \\
+16 &              & guns\textunderscore 1 \\
+17 & smoother     & s(age)  \\
+18 &              & s(log\textunderscore ppi)  \\
+19 &              & s(cnty\textunderscore pct\textunderscore religious)  \\
+20 &              & s(cnty\textunderscore pct\textunderscore evangelical) \\
+21 &              & s(log\textunderscore nchildren) \\
+\hline
+\end{tabular}
+\end{table}
+
+\bigskip
+
+#### Categorical variables 
+
+Since \texttt{sex} is a categorical variable which takes on three different values: \texttt{F} (female), \texttt{M} (male), and \texttt{U} (unidentified), it gets encoded as two binary variables, with \texttt{F} as the reference group. Holding other predictors fixed, on average, being a male corresponds to a 0.41 decrease in log odds that the person supports the Democratic party compared to if the person was a female. Similarly, holding other predictors constant, the log odds of supporting the Democratic party for a person whose sex has not been specified is 0.27 lower than that for a female on average. This follows our intuition, as the issues that Democrats support are largely in line with women's rights, hence a higher propensity for women to support Democrats.
+
+The \verb+combined_ethnicity_4way+ coefficients can be interpretted similarly, where the reference group is Asian, and B stands for Black, H for Hispanic, and W for White. The reference group for the \verb+education+ variable is \verb+bach degree+, and the reference group for the \verb+density_clean+ variable is \verb+rural+. Lastly, the reference group for \verb+marital_status_clean+ is married. The direction of these coefficients are also largely in line with our expectations. The positive coefficient for African Americans versus the negative coefficient for White people reaffirms the fact that African Americans are more likely to vote Democrat, and White people to vote Republican. 
+
+\bigskip
+
+#### Binary variables
+
+The interpretation of coefficient estimates for binary variables is similar to that for categorical variables, where the reference group is now the group that correspond to value 0 of the binary variable. To see this, consider \verb+liberal_donor+ as an example. On average, fixing other variables, the log odds of supporting the Democratic party for a person who has donated to liberal causes is 0.89 higher than that for a person who has never donated to liberal causes. Unsurprisingly, the coefficient for \verb+liberal_donor+ is positive, while \verb+conservative_donor+ and \verb+guns+ are negative. A result that we were not expecting is the relationship of owning a cat to political preference: with a negative coefficient, our model suggests that cat owners are more likely to support Republicans.
+
+#### Continuous variables
+
+\noindent While there are no estimated coefficients associated with the smooths of the continuous variables, we can understand their impact on predictions by examining plots of these smooth functions. For example, as \verb+cnty_pct_evangelical+ increases, the probability that a voter supports democrats decreases, albeit in a non-linear way. With \verb+age+ the relationship isn't monotonic; we see very young people more likely to support Democrats (as expected), but also an increase in likelihood around the age of 70.
+
+```{r}
+plot(final_model, se=TRUE)
+```
+
+## Conclusion
+
+Based on the methods and considerations in this project, it is evident that generalized additive models are a powerful tool in making predictions in a binary response setting. We applied and compared various methods associated with generalized linear models and additive models to achieve the best predictive power in this binary classification problem.
+
+Our modeling approach was to first build a robust baseline model using the stepwise backward selection procedure starting out with all predictors. Subsequently, we applied techniques such as smoothers and interactions terms to improve the predictive power of the model. In hindsight, this seemed a reasonable approach, since at each step, we observed an (albeit small) improvement on the discrepancy score. The likelihood ratio test played an important role in selecting the combination of variables that would lead to the best predictive model. We tested various aspects of fitting GLMs, such as the choice of the link function, consideration and interpretation of interaction terms, and smoothing continuous predictor variables. After identifying the model with the best predictive power, we used diagnostic tests such as the Hosmer Lemeshow Test, the binned residual plot and the Cook's distance plot to verify whether there were issues with the model fit.
+
+Based on the low observed p-values of the predictors, it is evident that they play an important role in predicting the political leaning of an individual. We gained an appreciation for the diversity of the attributes that inform an individual's political preferences, and in a general sense, of how we can leverage data to better understand voter behavior.
+
+Perhaps the greatest challenge we encountered in this process was the amount of missingness in the categorical predictors. Had the dataset been complete, we would have been able to test all interactions, which might have resulted in a model with better predictive power. One remedy for this issue would be to consider model-based imputation. In terms of modeling methods, more complex models such as support vector machines and neural networks could result in higher classification accuracies, but the results obtained from these techniques would be more difficult to interpret. 
+
+Overall, the analysis was a great opportunity to explore most tools related to generalized linear and additive models that have been introduced during the course.
+
+\newpage
+## Appendix 
+
+1. \underline{Summary of binary indicators}
+
+```{r}
+df_bin_summary %>% arrange(desc(Abs_Delta)) %>% 
+  kable(col.names=c("Binary Indicator", "% Obs. = 1", "% Supp. Dem (Ind=0)", "% Supp. Dem (Ind=1)", "Abs. Diff in % Supp Dem"), digits = 2, caption = 'Summary Statistics for Binary Indicators and Association with Outcome')
+```
+
+2. \underline{Baseline model with all cleaned predictors}
+
+```{r, results='asis'}
+tidy(baseline_all_preds) %>% 
+  mutate(Sig = stars.pval(p.value)) %>% 
+  kable(caption = "Baseline Model (All Predictors)", digits = 2, col.names=c("Predictor", "Est", "Std Err", "t-Stat", "P-Value", "Sig?")) 
+```
+
